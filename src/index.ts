@@ -2,7 +2,7 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { jwt, sign, verify } from 'hono/jwt'
-import { eq, like, and, or, desc, asc, sql } from 'drizzle-orm'
+import { eq, like, ilike, and, or, desc, asc, sql } from 'drizzle-orm'
 import bcrypt from 'bcryptjs'
 import { OAuth2Client } from 'google-auth-library'
 import * as dotenv from 'dotenv'
@@ -10,7 +10,9 @@ import * as dotenv from 'dotenv'
 dotenv.config()
 
 import { db } from './db/index.js'
-import { manhwas, users, chapters, categories, tags, manhwasToCategories, manhwasToTags, readingHistory, bookmarks } from './db/schema.js'
+import { manhwas, users, chapters, categories, tags, manhwasToCategories, manhwasToTags, readingHistory, bookmarks, characters, staff, manhwasToStaff, comments, commentLikes } from './db/schema.js'
+import { serveStatic } from '@hono/node-server/serve-static'
+import { uploadFile, deleteFile } from './services/storage.js'
 
 interface AppJWTPayload {
   id: number;
@@ -18,6 +20,8 @@ interface AppJWTPayload {
   role: string;
   exp: number;
 }
+
+import path from 'path'
 
 const app = new Hono()
 
@@ -27,6 +31,10 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'your_google_client_id.
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID)
 
 app.use('*', cors())
+app.use('/uploads/*', serveStatic({ 
+  root: './',
+  rewriteRequestPath: (p) => p.replace(/^\//, '')
+}))
 
 // Auth routes
 app.post('/api/auth/register', async (c) => {
@@ -220,6 +228,85 @@ app.get('/api/auth/me', async (c) => {
   }
 })
 
+app.put('/api/auth/profile', authMiddleware, async (c) => {
+  try {
+    const payload = c.get('jwtPayload') as unknown as AppJWTPayload
+    const userId = payload.id
+
+    const { name, email, avatar, password, currentPassword } = await c.req.json()
+
+    // 1. Fetch user
+    const userResult = await db.select().from(users).where(eq(users.id, userId))
+    const user = userResult[0]
+    if (!user) {
+      return c.json({ error: 'Хэрэглэгч олдсонгүй' }, 404)
+    }
+
+    const updateFields: any = { updatedAt: new Date() }
+
+    // 2. Handle profile fields
+    if (name) updateFields.name = name
+    
+    if (email && email !== user.email) {
+      // Check if email already taken
+      const existingEmail = await db.select().from(users).where(eq(users.email, email))
+      if (existingEmail.length > 0) {
+        return c.json({ error: 'Энэ имэйл хаяг өөр хэрэглэгч дээр бүртгэлтэй байна' }, 400)
+      }
+      updateFields.email = email
+    }
+
+    if (avatar !== undefined) {
+      updateFields.avatar = avatar
+    }
+
+    // 3. Handle password change
+    if (password) {
+      if (!currentPassword) {
+        return c.json({ error: 'Одоогийн нууц үгийг оруулна уу' }, 400)
+      }
+      if (user.password) {
+        const passwordMatches = await bcrypt.compare(currentPassword, user.password)
+        if (!passwordMatches) {
+          return c.json({ error: 'Одоогийн нууц үг буруу байна' }, 400)
+        }
+      }
+      const hashedPassword = await bcrypt.hash(password, 10)
+      updateFields.password = hashedPassword
+    }
+
+    // 4. Update DB
+    const updatedUsers = await db.update(users)
+      .set(updateFields)
+      .where(eq(users.id, userId))
+      .returning()
+    
+    const updatedUser = updatedUsers[0]
+
+    // 5. Generate a new token so that context synchronizes
+    const token = await sign({ 
+      id: updatedUser.id, 
+      email: updatedUser.email, 
+      role: updatedUser.role,
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 // 7 days
+    }, JWT_SECRET, 'HS256')
+
+    return c.json({
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        avatar: updatedUser.avatar
+      },
+      token
+    })
+  } catch (error: any) {
+    return c.json({ error: 'Профайл шинэчлэхэд алдаа гарлаа: ' + error.message }, 500)
+  }
+})
+
+
 // Middleware to check roles
 const checkRole = (roles: string[]) => {
   return async (c: any, next: any) => {
@@ -274,7 +361,12 @@ app.get('/api/manhwas', async (c) => {
     }
 
     if (q) {
-      conditions.push(like(manhwas.title, `%${q}%`));
+      conditions.push(
+        or(
+          ilike(manhwas.title, `%${q}%`),
+          ilike(manhwas.alternativeTitles, `%${q}%`)
+        )
+      );
     }
 
     if (type) {
@@ -373,6 +465,12 @@ app.get('/api/manhwas/:id', async (c) => {
           with: {
             tag: true
           }
+        },
+        characters: true,
+        staff: {
+          with: {
+            staff: true
+          }
         }
       }
     })
@@ -385,7 +483,12 @@ app.get('/api/manhwas/:id', async (c) => {
     const formattedManga = {
       ...manga,
       categories: manga.categories.map(c => c.category),
-      tags: manga.tags.map(t => t.tag)
+      tags: manga.tags.map(t => t.tag),
+      characters: manga.characters || [],
+      staff: manga.staff?.map(s => ({
+        ...s.staff,
+        role: s.role
+      })) || []
     }
     
     // Check if manga is premium and user is not VIP/Moderator/Admin
@@ -430,13 +533,171 @@ app.get('/api/admin/stats', checkRole(['admin', 'moderator']), async (c) => {
   }
 })
 
+// Helper to resolve category names or IDs and return their resolved IDs
+async function resolveCategories(items: (string | number)[]): Promise<number[]> {
+  const ids: number[] = []
+  for (const item of items) {
+    if (typeof item === 'number') {
+      ids.push(item)
+      continue
+    }
+    if (typeof item === 'string' && !isNaN(Number(item))) {
+      ids.push(Number(item))
+      continue
+    }
+    const name = String(item).trim()
+    if (!name) continue
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+    
+    // Find category by exact name
+    let cat = await db.query.categories.findFirst({
+      where: eq(categories.name, name)
+    })
+    
+    if (!cat) {
+      // Find category by slug
+      cat = await db.query.categories.findFirst({
+        where: eq(categories.slug, slug)
+      })
+    }
+    
+    if (!cat) {
+      // Create new category
+      const inserted = await db.insert(categories).values({ name, slug }).returning()
+      cat = inserted[0]
+    }
+    
+    if (cat) {
+      ids.push(cat.id)
+    }
+  }
+  return ids
+}
+
+// Helper to resolve tag names or IDs and return their resolved IDs
+async function resolveTags(items: (string | number)[]): Promise<number[]> {
+  const ids: number[] = []
+  for (const item of items) {
+    if (typeof item === 'number') {
+      ids.push(item)
+      continue
+    }
+    if (typeof item === 'string' && !isNaN(Number(item))) {
+      ids.push(Number(item))
+      continue
+    }
+    const name = String(item).trim()
+    if (!name) continue
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+    
+    // Find tag by exact name
+    let tagRecord = await db.query.tags.findFirst({
+      where: eq(tags.name, name)
+    })
+    
+    if (!tagRecord) {
+      // Find tag by slug
+      tagRecord = await db.query.tags.findFirst({
+        where: eq(tags.slug, slug)
+      })
+    }
+    
+    if (!tagRecord) {
+      // Create new tag
+      const inserted = await db.insert(tags).values({ name, slug }).returning()
+      tagRecord = inserted[0]
+    }
+    
+    if (tagRecord) {
+      ids.push(tagRecord.id)
+    }
+  }
+  return ids
+}
+
 // Manage Manhwas
 app.post('/api/admin/manhwas', checkRole(['admin', 'moderator']), async (c) => {
   try {
     const data = await c.req.json()
     // Remove relations and id if present
-    const { categories, tags, id, createdAt, updatedAt, ...insertData } = data
+    const { 
+      categories: categoryItems, 
+      tags: tagItems, 
+      characters: characterItems,
+      staff: staffItems,
+      id, 
+      createdAt, 
+      updatedAt, 
+      ...insertData 
+    } = data
     const newManhwa = await db.insert(manhwas).values(insertData).returning()
+    const manhwaId = newManhwa[0].id
+
+    // Insert category links if provided (can be mix of IDs and string names)
+    if (categoryItems && Array.isArray(categoryItems)) {
+      const categoryIds = await resolveCategories(categoryItems)
+      const catLinks = categoryIds.map((catId: number) => ({ manhwaId, categoryId: catId }))
+      if (catLinks.length > 0) {
+        await db.insert(manhwasToCategories).values(catLinks)
+      }
+    }
+
+    // Insert tag links if provided (can be mix of IDs and string names)
+    if (tagItems && Array.isArray(tagItems)) {
+      const tagIds = await resolveTags(tagItems)
+      const tagLinks = tagIds.map((tId: number) => ({ manhwaId, tagId: tId }))
+      if (tagLinks.length > 0) {
+        await db.insert(manhwasToTags).values(tagLinks)
+      }
+    }
+
+    // Insert characters if provided
+    if (characterItems && Array.isArray(characterItems)) {
+      const charValues = characterItems.map((char: any) => ({
+        manhwaId,
+        name: char.name,
+        image: char.image || '',
+        role: char.role || 'MAIN',
+        anilistId: char.anilistId || null,
+      }))
+      if (charValues.length > 0) {
+        await db.insert(characters).values(charValues)
+      }
+    }
+
+    // Insert/Resolve staff and link them
+    if (staffItems && Array.isArray(staffItems)) {
+      for (const item of staffItems) {
+        let staffRecord = null
+        if (item.anilistId) {
+          staffRecord = await db.query.staff.findFirst({
+            where: eq(staff.anilistId, item.anilistId)
+          })
+        }
+        if (!staffRecord) {
+          staffRecord = await db.query.staff.findFirst({
+            where: eq(staff.name, item.name)
+          })
+        }
+        if (!staffRecord) {
+          const inserted = await db.insert(staff).values({
+            name: item.name,
+            image: item.image || '',
+            description: item.description || '',
+            anilistId: item.anilistId || null
+          }).returning()
+          staffRecord = inserted[0]
+        }
+        
+        // Link staff to manhwa
+        await db.insert(manhwasToStaff).values({
+          manhwaId,
+          staffId: staffRecord.id,
+          role: item.role || 'Story'
+        })
+      }
+    }
+
     return c.json(newManhwa[0])
   } catch (error: any) {
     return c.json({ error: 'Манхва нэмэхэд алдаа гарлаа: ' + error.message }, 500)
@@ -449,7 +710,16 @@ app.put('/api/admin/manhwas/:id', checkRole(['admin', 'moderator']), async (c) =
     const data = await c.req.json()
     
     // Remove relations, id, and dates that are strings
-    const { categories, tags, id: _, createdAt, updatedAt, ...updateData } = data
+    const { 
+      categories: categoryItems, 
+      tags: tagItems, 
+      characters: characterItems,
+      staff: staffItems,
+      id: _, 
+      createdAt, 
+      updatedAt, 
+      ...updateData 
+    } = data
     
     const updated = await db.update(manhwas)
       .set({
@@ -458,6 +728,75 @@ app.put('/api/admin/manhwas/:id', checkRole(['admin', 'moderator']), async (c) =
       })
       .where(eq(manhwas.id, id))
       .returning()
+
+    // Sync categories (resolve mix of string names/ids)
+    if (categoryItems && Array.isArray(categoryItems)) {
+      await db.delete(manhwasToCategories).where(eq(manhwasToCategories.manhwaId, id))
+      const categoryIds = await resolveCategories(categoryItems)
+      const catLinks = categoryIds.map((catId: number) => ({ manhwaId: id, categoryId: catId }))
+      if (catLinks.length > 0) {
+        await db.insert(manhwasToCategories).values(catLinks)
+      }
+    }
+
+    // Sync tags (resolve mix of string names/ids)
+    if (tagItems && Array.isArray(tagItems)) {
+      await db.delete(manhwasToTags).where(eq(manhwasToTags.manhwaId, id))
+      const tagIds = await resolveTags(tagItems)
+      const tagLinks = tagIds.map((tId: number) => ({ manhwaId: id, tagId: tId }))
+      if (tagLinks.length > 0) {
+        await db.insert(manhwasToTags).values(tagLinks)
+      }
+    }
+
+    // Sync characters (re-insert all)
+    if (characterItems && Array.isArray(characterItems)) {
+      await db.delete(characters).where(eq(characters.manhwaId, id))
+      const charValues = characterItems.map((char: any) => ({
+        manhwaId: id,
+        name: char.name,
+        image: char.image || '',
+        role: char.role || 'MAIN',
+        anilistId: char.anilistId || null,
+      }))
+      if (charValues.length > 0) {
+        await db.insert(characters).values(charValues)
+      }
+    }
+
+    // Sync staff (re-link all)
+    if (staffItems && Array.isArray(staffItems)) {
+      await db.delete(manhwasToStaff).where(eq(manhwasToStaff.manhwaId, id))
+      for (const item of staffItems) {
+        let staffRecord = null
+        if (item.anilistId) {
+          staffRecord = await db.query.staff.findFirst({
+            where: eq(staff.anilistId, item.anilistId)
+          })
+        }
+        if (!staffRecord) {
+          staffRecord = await db.query.staff.findFirst({
+            where: eq(staff.name, item.name)
+          })
+        }
+        if (!staffRecord) {
+          const inserted = await db.insert(staff).values({
+            name: item.name,
+            image: item.image || '',
+            description: item.description || '',
+            anilistId: item.anilistId || null
+          }).returning()
+          staffRecord = inserted[0]
+        }
+        
+        // Link staff to manhwa
+        await db.insert(manhwasToStaff).values({
+          manhwaId: id,
+          staffId: staffRecord.id,
+          role: item.role || 'Story'
+        })
+      }
+    }
       
     return c.json(updated[0])
   } catch (error: any) {
@@ -465,12 +804,82 @@ app.put('/api/admin/manhwas/:id', checkRole(['admin', 'moderator']), async (c) =
   }
 })
 
+app.get('/api/staff/:id', async (c) => {
+  const id = parseInt(c.req.param('id'))
+  if (isNaN(id)) {
+    return c.json({ error: 'Буруу ID байна' }, 400)
+  }
+
+  try {
+    const staffMember = await db.query.staff.findFirst({
+      where: eq(staff.id, id),
+      with: {
+        manhwas: {
+          with: {
+            manhwa: true
+          }
+        }
+      }
+    })
+
+    if (!staffMember) {
+      return c.json({ error: 'Ажилтан олдсонгүй' }, 404)
+    }
+
+    // Format works
+    const formattedStaff = {
+      ...staffMember,
+      works: staffMember.manhwas?.map(w => ({
+        ...w.manhwa,
+        role: w.role
+      })) || []
+    }
+
+    return c.json(formattedStaff)
+  } catch (error: any) {
+    return c.json({ error: 'Ажилтны мэдээлэл татахад алдаа гарлаа: ' + error.message }, 500)
+  }
+})
+
 app.delete('/api/admin/manhwas/:id', checkRole(['admin']), async (c) => {
   try {
     const id = parseInt(c.req.param('id'))
+    if (isNaN(id)) {
+      return c.json({ error: 'Буруу ID байна' }, 400)
+    }
+
+    // 1. Fetch manhwa to prune cover image
+    const manhwaToDelete = await db.select().from(manhwas).where(eq(manhwas.id, id))
+    if (manhwaToDelete[0]?.coverImage) {
+      await deleteFile(manhwaToDelete[0].coverImage)
+    }
+
+    // 2. Fetch and prune all chapters' page files
+    const chaptersToDelete = await db.select().from(chapters).where(eq(chapters.manhwaId, id))
+    for (const chapter of chaptersToDelete) {
+      try {
+        const pages = JSON.parse(chapter.content || '[]') as string[]
+        for (const pageUrl of pages) {
+          await deleteFile(pageUrl)
+        }
+      } catch (err) {
+        console.error('Failed to parse pages for deletion on manhwa delete:', err)
+      }
+    }
+
+    // 3. Manually clean up all dependent reference tables first
+    await db.delete(manhwasToCategories).where(eq(manhwasToCategories.manhwaId, id))
+    await db.delete(manhwasToTags).where(eq(manhwasToTags.manhwaId, id))
+    await db.delete(readingHistory).where(eq(readingHistory.manhwaId, id))
+    await db.delete(bookmarks).where(eq(bookmarks.manhwaId, id))
+    await db.delete(chapters).where(eq(chapters.manhwaId, id))
+
+    // 4. Safely delete the manhwa (characters & staff link will cascade automatically from schema onDelete rules)
     await db.delete(manhwas).where(eq(manhwas.id, id))
+
     return c.json({ success: true })
   } catch (error: any) {
+    console.error('Delete Manhwa Error:', error)
     return c.json({ error: 'Устгахад алдаа гарлаа: ' + error.message }, 500)
   }
 })
@@ -525,8 +934,15 @@ app.get('/api/admin/users', checkRole(['admin', 'moderator']), async (c) => {
       email: users.email,
       role: users.role,
       avatar: users.avatar,
-      createdAt: users.createdAt
-    }).from(users);
+      createdAt: users.createdAt,
+      bookmarksCount: sql<number>`count(distinct ${bookmarks.id})`.mapWith(Number),
+      historyCount: sql<number>`count(distinct ${readingHistory.id})`.mapWith(Number),
+    })
+    .from(users)
+    .leftJoin(bookmarks, eq(bookmarks.userId, users.id))
+    .leftJoin(readingHistory, eq(readingHistory.userId, users.id))
+    .groupBy(users.id);
+
     return c.json(allUsers);
   } catch (error: any) {
     return c.json({ error: 'Хэрэглэгчдийн мэдээллийг татахад алдаа гарлаа: ' + error.message }, 500)
@@ -607,6 +1023,21 @@ app.put('/api/admin/chapters/:id', checkRole(['admin', 'moderator']), async (c) 
     
     // Remove id and dates
     const { id: _, createdAt, updatedAt, ...updateData } = data
+
+    // Compare and prune deleted pages from storage
+    const existingChapter = await db.select().from(chapters).where(eq(chapters.id, id))
+    if (existingChapter[0]) {
+      try {
+        const oldPages = JSON.parse(existingChapter[0].content || '[]') as string[]
+        const newPages = JSON.parse(data.content || '[]') as string[]
+        const pagesToDelete = oldPages.filter(p => !newPages.includes(p))
+        for (const pageUrl of pagesToDelete) {
+          await deleteFile(pageUrl)
+        }
+      } catch (err) {
+        console.error('Failed to parse pages for deletion on update:', err)
+      }
+    }
     
     const updated = await db.update(chapters)
       .set({
@@ -628,6 +1059,17 @@ app.delete('/api/admin/chapters/:id', checkRole(['admin']), async (c) => {
     const chapterToDelete = await db.select().from(chapters).where(eq(chapters.id, id))
     if (chapterToDelete[0]) {
       const manhwaId = chapterToDelete[0].manhwaId
+
+      // Delete associated page files from storage
+      try {
+        const pages = JSON.parse(chapterToDelete[0].content || '[]') as string[]
+        for (const pageUrl of pages) {
+          await deleteFile(pageUrl)
+        }
+      } catch (err) {
+        console.error('Failed to parse pages for deletion on delete:', err)
+      }
+
       await db.delete(chapters).where(eq(chapters.id, id))
       const countResult = await db.select().from(chapters).where(eq(chapters.manhwaId, manhwaId))
       await db.update(manhwas).set({ chapterCount: countResult.length.toString() }).where(eq(manhwas.id, manhwaId))
@@ -796,6 +1238,357 @@ app.get('/api/bookmarks/check/:manhwaId', authMiddleware, async (c) => {
   }
 })
 
+// Upload Route
+app.post('/api/admin/upload', checkRole(['admin', 'moderator']), async (c) => {
+  try {
+    const body = await c.req.parseBody()
+    const file = body['file'] as File
+    const folder = body['folder'] as string || 'general'
+    const storageType = body['storage_type'] as string || undefined
+
+    if (!file) {
+      return c.json({ error: 'Файл олдсонгүй' }, 400)
+    }
+
+    const url = await uploadFile(file, folder, storageType)
+    return c.json({ url })
+  } catch (error: any) {
+    console.error('Upload Error:', error)
+    return c.json({ error: 'Файл хуулахад алдаа гарлаа: ' + error.message }, 500)
+  }
+})
+
+// Helper to perform fetch requests with optional HTTP/HTTPS proxy support
+async function fetchWithProxy(url: string, init?: RequestInit): Promise<Response> {
+  let dispatcher: any = undefined;
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ANILIST_PROXY;
+  if (proxyUrl) {
+    try {
+      const { ProxyAgent } = await import('undici');
+      dispatcher = new ProxyAgent(proxyUrl);
+    } catch (err) {
+      console.error('[Proxy] Failed to initialize ProxyAgent from undici:', err);
+    }
+  }
+  
+  // Create safe headers object and set standard browser User-Agent to bypass Cloudflare bot protection (403 errors)
+  const headers = new Headers(init?.headers);
+  if (!headers.has('User-Agent')) {
+    headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  }
+  
+  const options = {
+    ...init,
+    headers,
+    ...(dispatcher ? { dispatcher } : {})
+  };
+  return fetch(url, options as any);
+}
+
+// Upload from URL Route
+app.post('/api/admin/upload-url', checkRole(['admin', 'moderator']), async (c) => {
+  try {
+    const { url, folder = 'covers', storage_type } = await c.req.json()
+    if (!url) {
+      return c.json({ error: 'URL шаардлагатай' }, 400)
+    }
+
+    console.log(`[Storage] Downloading image from URL: ${url}`)
+    const response = await fetchWithProxy(url)
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image from URL: ${response.statusText}`)
+    }
+
+    const arrayBuffer = await response.arrayBuffer()
+    const contentType = response.headers.get('content-type') || 'image/jpeg'
+    const parsedUrl = new URL(url)
+    const filename = path.basename(parsedUrl.pathname) || 'cover.jpg'
+    
+    const blob = new Blob([arrayBuffer], { type: contentType })
+    ;(blob as any).name = filename
+
+    const uploadedUrl = await uploadFile(blob, folder, storage_type)
+    console.log(`[Storage] Successfully uploaded cover from URL to: ${uploadedUrl}`)
+    return c.json({ url: uploadedUrl })
+  } catch (error: any) {
+    console.error('Upload URL Error:', error)
+    return c.json({ error: 'Зургийн URL-аас хуулахад алдаа гарлаа: ' + error.message }, 500)
+  }
+})
+
+// AniList Search Proxy Route
+app.post('/api/admin/anilist-search', checkRole(['admin', 'moderator']), async (c) => {
+  try {
+    const { query, variables } = await c.req.json()
+    
+    console.log(`[AniList Proxy] Forwarding query to AniList GraphQL API...`)
+    const response = await fetchWithProxy('https://graphql.anilist.co', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ query, variables })
+    })
+
+    if (!response.ok) {
+      let errorMsg = `AniList responded with status ${response.status}`
+      try {
+        const errJson = await response.json()
+        if (errJson && errJson.errors && Array.isArray(errJson.errors) && errJson.errors[0]?.message) {
+          errorMsg = errJson.errors[0].message
+        }
+      } catch (e) {
+        // If parsing JSON fails, try fallback to read response text
+        console.error(`[AniList Proxy Error] Failed to parse JSON error:`, e)
+      }
+      console.error(`[AniList Proxy Error] Response status ${response.status}: ${errorMsg}`)
+      return c.json({ error: errorMsg }, response.status as any)
+    }
+
+    const data = await response.json()
+    return c.json(data)
+  } catch (error: any) {
+    console.error('[AniList Proxy Error]:', error)
+    return c.json({ error: 'Error connecting to AniList service: ' + error.message }, 500)
+  }
+})
+
+// Comments Endpoints
+app.get('/api/comments', async (c) => {
+  try {
+    const manhwaIdStr = c.req.query('manhwaId');
+    const chapterIdStr = c.req.query('chapterId');
+    
+    if (!manhwaIdStr) {
+      return c.json({ error: 'Манхва ID шаардлагатай' }, 400);
+    }
+    
+    const manhwaId = parseInt(manhwaIdStr);
+    const chapterId = chapterIdStr ? parseInt(chapterIdStr) : null;
+    
+    let conditions = [eq(comments.manhwaId, manhwaId)];
+    if (chapterId) {
+      conditions.push(eq(comments.chapterId, chapterId));
+    } else {
+      conditions.push(sql`${comments.chapterId} IS NULL`);
+    }
+    
+    // Only fetch top-level comments first
+    conditions.push(sql`${comments.parentId} IS NULL`);
+    
+    const result = await db.query.comments.findMany({
+      where: and(...conditions),
+      orderBy: desc(comments.createdAt),
+      with: {
+        user: {
+          columns: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            avatar: true,
+          }
+        },
+        replies: {
+          with: {
+            user: {
+              columns: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                avatar: true,
+              }
+            }
+          },
+          orderBy: asc(comments.createdAt)
+        }
+      }
+    });
+    
+    return c.json(result);
+  } catch (error: any) {
+    console.error('Fetch comments error:', error);
+    return c.json({ error: 'Сэтгэгдэл татахад алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
+app.post('/api/comments', authMiddleware, async (c) => {
+  try {
+    const { manhwaId, chapterId, parentId, content } = await c.req.json();
+    const payload = c.get('jwtPayload') as unknown as AppJWTPayload;
+    const userId = payload.id;
+    
+    if (!manhwaId || !content || content.trim() === '') {
+      return c.json({ error: 'Мэдээлэл дутуу байна' }, 400);
+    }
+    
+    const inserted = await db.insert(comments).values({
+      manhwaId: parseInt(manhwaId),
+      chapterId: chapterId ? parseInt(chapterId) : null,
+      userId,
+      parentId: parentId ? parseInt(parentId) : null,
+      content,
+    }).returning();
+    
+    const commentId = inserted[0].id;
+    const fullComment = await db.query.comments.findFirst({
+      where: eq(comments.id, commentId),
+      with: {
+        user: {
+          columns: {
+            id: true,
+            name: true,
+            email: true,
+            role: true,
+            avatar: true,
+          }
+        },
+        replies: {
+          with: {
+            user: {
+              columns: {
+                id: true,
+                name: true,
+                email: true,
+                role: true,
+                avatar: true,
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    return c.json(fullComment);
+  } catch (error: any) {
+    return c.json({ error: 'Сэтгэгдэл үүсгэхэд алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
+app.put('/api/comments/:id', authMiddleware, async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    const { content } = await c.req.json();
+    const payload = c.get('jwtPayload') as unknown as AppJWTPayload;
+    const userId = payload.id;
+    
+    if (!content || content.trim() === '') {
+      return c.json({ error: 'Агуулга хоосон байж болохгүй' }, 400);
+    }
+    
+    const existing = await db.select().from(comments).where(eq(comments.id, id));
+    if (existing.length === 0) {
+      return c.json({ error: 'Сэтгэгдэл олдсонгүй' }, 404);
+    }
+    
+    if (existing[0].userId !== userId && payload.role !== 'admin' && payload.role !== 'moderator') {
+      return c.json({ error: 'Хандах эрхгүй байна' }, 403);
+    }
+    
+    const updated = await db.update(comments)
+      .set({
+        content,
+        isEdited: 1,
+        updatedAt: new Date()
+      })
+      .where(eq(comments.id, id))
+      .returning();
+      
+    return c.json(updated[0]);
+  } catch (error: any) {
+    return c.json({ error: 'Сэтгэгдэл засахад алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
+app.delete('/api/comments/:id', authMiddleware, async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    const payload = c.get('jwtPayload') as unknown as AppJWTPayload;
+    const userId = payload.id;
+    
+    const existing = await db.select().from(comments).where(eq(comments.id, id));
+    if (existing.length === 0) {
+      return c.json({ error: 'Сэтгэгдэл олдсонгүй' }, 404);
+    }
+    
+    if (existing[0].userId !== userId && payload.role !== 'admin' && payload.role !== 'moderator') {
+      return c.json({ error: 'Хандах эрхгүй байна' }, 403);
+    }
+    
+    await db.delete(comments).where(eq(comments.id, id));
+    return c.json({ success: true });
+  } catch (error: any) {
+    return c.json({ error: 'Сэтгэгдэл устгахад алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
+app.post('/api/comments/:id/like', authMiddleware, async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    const { type } = await c.req.json();
+    const payload = c.get('jwtPayload') as unknown as AppJWTPayload;
+    const userId = payload.id;
+    
+    if (!['like', 'dislike', 'unlike'].includes(type)) {
+      return c.json({ error: 'Буруу үйлдэл байна' }, 400);
+    }
+    
+    const comment = await db.select().from(comments).where(eq(comments.id, id));
+    if (comment.length === 0) {
+      return c.json({ error: 'Сэтгэгдэл олдсонгүй' }, 404);
+    }
+    
+    const existing = await db.select()
+      .from(commentLikes)
+      .where(and(eq(commentLikes.commentId, id), eq(commentLikes.userId, userId)));
+      
+    if (existing.length > 0) {
+      const prevType = existing[0].type;
+      
+      if (type === 'unlike' || prevType === type) {
+        await db.delete(commentLikes).where(eq(commentLikes.id, existing[0].id));
+        const valToSub = prevType === 'like' ? { likes: Math.max(0, comment[0].likes - 1) } : { dislikes: Math.max(0, comment[0].dislikes - 1) };
+        await db.update(comments).set(valToSub).where(eq(comments.id, id));
+      } else {
+        await db.update(commentLikes).set({ type }).where(eq(commentLikes.id, existing[0].id));
+        const newLikes = type === 'like' ? comment[0].likes + 1 : Math.max(0, comment[0].likes - 1);
+        const newDislikes = type === 'dislike' ? comment[0].dislikes + 1 : Math.max(0, comment[0].dislikes - 1);
+        await db.update(comments).set({ likes: newLikes, dislikes: newDislikes }).where(eq(comments.id, id));
+      }
+    } else if (type !== 'unlike') {
+      await db.insert(commentLikes).values({
+        commentId: id,
+        userId,
+        type,
+      });
+      const valToAdd = type === 'like' ? { likes: comment[0].likes + 1 } : { dislikes: comment[0].dislikes + 1 };
+      await db.update(comments).set(valToAdd).where(eq(comments.id, id));
+    }
+    
+    const updatedComment = await db.select().from(comments).where(eq(comments.id, id));
+    return c.json(updatedComment[0]);
+  } catch (error: any) {
+    return c.json({ error: 'Үйлдэл гүйцэтгэхэд алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
+app.post('/api/comments/:id/report', authMiddleware, async (c) => {
+  try {
+    const id = parseInt(c.req.param('id'));
+    const existing = await db.select().from(comments).where(eq(comments.id, id));
+    if (existing.length === 0) {
+      return c.json({ error: 'Сэтгэгдэл олдсонгүй' }, 404);
+    }
+    
+    await db.update(comments).set({ isReported: 1 }).where(eq(comments.id, id));
+    return c.json({ success: true });
+  } catch (error: any) {
+    return c.json({ error: 'Мэдээлэхэд алдаа гарлаа: ' + error.message }, 500);
+  }
+});
+
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001
 
 serve({
@@ -804,3 +1597,4 @@ serve({
 }, (info) => {
   console.log(`Server is running on http://localhost:${info.port}`)
 })
+

@@ -2,21 +2,25 @@
   "name": "api",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "node --watch --import tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
-    "db:seed": "tsx src/db/seed.ts"
+    "db:seed": "tsx src/db/seed.ts",
+    "db:clean": "tsx src/scripts/clean-db.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1048.0",
+    "@aws-sdk/lib-storage": "^3.1048.0",
     "@hono/node-server": "^1.19.14",
     "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "google-auth-library": "^10.6.2",
     "hono": "^4.12.18",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "undici": "^8.3.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",

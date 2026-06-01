@@ -6,14 +6,21 @@ export const manhwas = pgTable('manhwas', {
   title: text('title').notNull(),
   description: text('description'),
   coverImage: text('cover_image'),
+  bannerImage: text('banner_image'),
   type: text('type').default('Manhwa'), // 'Manhwa', 'Manga', 'Manhua'
-  status: text('status').default('Үргэлжлэх'), // 'Үргэлжлэх', 'Дууссан', 'Завсарласан'
+  status: text('status').default('Гарч байгаа'), // 'Гарч байгаа', 'Дууссан', 'Завсарласан'
   rating: text('rating').default('0.0'),
   chapterCount: text('chapter_count').default('0'),
   author: text('author'),
   artist: text('artist'),
   isFeatured: text('is_featured').default('false'),
   isPremium: text('is_premium').default('false'),
+  anilistId: integer('anilist_id'),
+  anilistUrl: text('anilist_url'),
+  alternativeTitles: text('alternative_titles'),
+  genres: text('genres'),
+  year: integer('year'),
+  averageScore: integer('average_score'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -54,6 +61,8 @@ export const manhwasRelations = relations(manhwas, ({ many }) => ({
   categories: many(manhwasToCategories),
   tags: many(manhwasToTags),
   chapters: many(chapters),
+  characters: many(characters),
+  staff: many(manhwasToStaff),
 }));
 
 export const categoriesRelations = relations(categories, ({ many }) => ({
@@ -149,5 +158,106 @@ export const bookmarksRelations = relations(bookmarks, ({ one }) => ({
 export const usersRelations = relations(users, ({ many }) => ({
   history: many(readingHistory),
   bookmarks: many(bookmarks),
+}));
+export const characters = pgTable('characters', {
+  id: serial('id').primaryKey(),
+  manhwaId: integer('manhwa_id').references(() => manhwas.id, { onDelete: 'cascade' }).notNull(),
+  name: text('name').notNull(),
+  image: text('image'),
+  role: text('role'), // 'MAIN', 'SUPPORTING'
+  anilistId: integer('anilist_id'),
+});
+
+export const staff = pgTable('staff', {
+  id: serial('id').primaryKey(),
+  name: text('name').notNull(),
+  image: text('image'),
+  description: text('description'),
+  anilistId: integer('anilist_id'),
+});
+
+export const manhwasToStaff = pgTable('manhwas_to_staff', {
+  manhwaId: integer('manhwa_id').references(() => manhwas.id, { onDelete: 'cascade' }).notNull(),
+  staffId: integer('staff_id').references(() => staff.id, { onDelete: 'cascade' }).notNull(),
+  role: text('role').notNull(), // e.g. 'Story', 'Art', 'Original Creator'
+});
+
+export const charactersRelations = relations(characters, ({ one }) => ({
+  manhwa: one(manhwas, {
+    fields: [characters.manhwaId],
+    references: [manhwas.id],
+  }),
+}));
+
+export const staffRelations = relations(staff, ({ many }) => ({
+  manhwas: many(manhwasToStaff),
+}));
+
+export const manhwasToStaffRelations = relations(manhwasToStaff, ({ one }) => ({
+  manhwa: one(manhwas, {
+    fields: [manhwasToStaff.manhwaId],
+    references: [manhwas.id],
+  }),
+  staff: one(staff, {
+    fields: [manhwasToStaff.staffId],
+    references: [staff.id],
+  }),
+}));
+
+export const comments = pgTable('comments', {
+  id: serial('id').primaryKey(),
+  manhwaId: integer('manhwa_id').references(() => manhwas.id, { onDelete: 'cascade' }).notNull(),
+  chapterId: integer('chapter_id').references(() => chapters.id, { onDelete: 'cascade' }),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  parentId: integer('parent_id'),
+  content: text('content').notNull(),
+  likes: integer('likes').default(0).notNull(),
+  dislikes: integer('dislikes').default(0).notNull(),
+  isEdited: integer('is_edited').default(0).notNull(),
+  isReported: integer('is_reported').default(0).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const commentLikes = pgTable('comment_likes', {
+  id: serial('id').primaryKey(),
+  commentId: integer('comment_id').references(() => comments.id, { onDelete: 'cascade' }).notNull(),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  type: text('type').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const commentsRelations = relations(comments, ({ one, many }) => ({
+  manhwa: one(manhwas, {
+    fields: [comments.manhwaId],
+    references: [manhwas.id],
+  }),
+  chapter: one(chapters, {
+    fields: [comments.chapterId],
+    references: [chapters.id],
+  }),
+  user: one(users, {
+    fields: [comments.userId],
+    references: [users.id],
+  }),
+  parent: one(comments, {
+    fields: [comments.parentId],
+    references: [comments.id],
+    relationName: 'comment_replies',
+  }),
+  replies: many(comments, {
+    relationName: 'comment_replies',
+  }),
+}));
+
+export const commentLikesRelations = relations(commentLikes, ({ one }) => ({
+  comment: one(comments, {
+    fields: [commentLikes.commentId],
+    references: [comments.id],
+  }),
+  user: one(users, {
+    fields: [commentLikes.userId],
+    references: [users.id],
+  }),
 }));
 

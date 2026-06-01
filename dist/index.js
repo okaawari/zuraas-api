@@ -6,6 +6,7 @@ import { eq, like, ilike, and, or, desc, asc, sql } from 'drizzle-orm';
 import bcrypt from 'bcryptjs';
 import { OAuth2Client } from 'google-auth-library';
 import * as dotenv from 'dotenv';
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
 dotenv.config();
 import { db } from './db/index.js';
 import { manhwas, users, chapters, categories, tags, manhwasToCategories, manhwasToTags, readingHistory, bookmarks, characters, staff, manhwasToStaff, comments, commentLikes } from './db/schema.js';
@@ -1410,6 +1411,15 @@ app.post('/api/comments/:id/report', authMiddleware, async (c) => {
         return c.json({ error: 'Мэдээлэхэд алдаа гарлаа: ' + error.message }, 500);
     }
 });
+// Run database migrations on startup
+try {
+    console.log('Running database migrations...');
+    await migrate(db, { migrationsFolder: './drizzle' });
+    console.log('Database migrations completed successfully!');
+}
+catch (migrationError) {
+    console.error('Database migrations failed:', migrationError);
+}
 const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 serve({
     fetch: app.fetch,

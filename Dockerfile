@@ -31,6 +31,7 @@ ENV PORT=3001
 # Copy package manifests and compiled files from builder
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/drizzle ./drizzle
 
 # Install production-only dependencies to keep the image slim
 RUN npm install --omit=dev
